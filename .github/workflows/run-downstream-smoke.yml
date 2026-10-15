@@ -34,8 +34,6 @@ on:
       - "uv.lock"
       - ".github/workflows/run-downstream-smoke.yml"
 
-  schedule:
-    - cron: "30 2 * * *"
 
   workflow_dispatch:
     inputs:
