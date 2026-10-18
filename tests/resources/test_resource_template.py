@@ -14,6 +14,7 @@ from fastmcp.resources.template import (
     expand_uri_template,
     match_uri_template,
 )
+from fastmcp.resources.types import BinaryResource, TextResource
 from fastmcp.server import create_proxy
 
 
@@ -373,6 +374,35 @@ class TestResourceTemplate:
                 uri_template="test://{x}/{args*}",
                 name="test",
             )
+
+    async def test_function_with_positional_only_not_allowed(self):
+        def func(x: int, /) -> int:
+            return x
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Functions with positional-only parameters are not supported as "
+                "resource templates.*standard parameters"
+            ),
+        ):
+            ResourceTemplate.from_function(
+                fn=func,
+                uri_template="test://{x}",
+                name="test",
+            )
+
+    async def test_function_with_keyword_only_ok(self):
+        def func(x: int, *, y: int = 1) -> int:
+            return x + y
+
+        template = ResourceTemplate.from_function(
+            fn=func,
+            uri_template="test://{x}{?y}",
+            name="test",
+        )
+
+        assert await template.read({"x": "2", "y": "3"}) == 5
 
     async def test_function_with_varkwargs_ok(self):
         def func(x: int, **kwargs: int) -> int:
@@ -781,14 +811,18 @@ class TestMalformedURITemplates:
         assert match is not None
         assert match.group("user_id") == "alice"
 
-    def test_pattern_cache_holds_more_templates_than_4096(self, monkeypatch):
-        """A read walks every template, so a pattern must still be cached after a
-        server with thousands of templates has matched against all of them."""
+    def test_template_keeps_its_own_pattern(self, monkeypatch):
+        """Reads walk every template, so each keeps its compiled pattern for as
+        long as it lives, independent of any shared cache."""
         from fastmcp.resources import template as template_module
 
-        templates = [f"many-templates://{i}/{{x}}" for i in range(5000)]
-        for uri_template in templates:
-            match_uri_template("many-templates://none", uri_template)
+        def weather(city: str) -> str:
+            return city
+
+        template = ResourceTemplate.from_function(
+            weather, uri_template="own-pattern://forecast/{city}"
+        )
+        assert template.matches("own-pattern://forecast/oslo") == {"city": "oslo"}
 
         builds = 0
         literal_pattern = template_module._literal_pattern
@@ -799,8 +833,75 @@ class TestMalformedURITemplates:
             return literal_pattern(text)
 
         monkeypatch.setattr(template_module, "_literal_pattern", counting)
-        assert match_uri_template("many-templates://0/a", templates[0]) == {"x": "a"}
+        template_module.build_regex.cache_clear()
+        for _ in range(10):
+            assert template.matches("own-pattern://forecast/bergen") == {
+                "city": "bergen"
+            }
         assert builds == 0
+
+    def test_template_pattern_follows_a_changed_uri_template(self):
+        def weather(city: str) -> str:
+            return city
+
+        template = ResourceTemplate.from_function(
+            weather, uri_template="before://{city}"
+        )
+        assert template.matches("before://oslo") == {"city": "oslo"}
+        renamed = template.model_copy(update={"uri_template": "after://{city}"})
+        assert renamed.matches("before://oslo") is None
+        assert renamed.matches("after://oslo") == {"city": "oslo"}
+
+    def test_mounted_template_wrapper_shares_the_source_pattern(self, monkeypatch):
+        """A mount wraps every template on every list, so a wrapper must not
+        compile the pattern again."""
+        from fastmcp.resources import template as template_module
+        from fastmcp.server.providers.fastmcp_provider import (
+            FastMCPProviderResourceTemplate,
+        )
+
+        def weather(city: str) -> str:
+            return city
+
+        source = ResourceTemplate.from_function(
+            weather, uri_template="mounted://forecast/{city}"
+        )
+        source.matches("mounted://forecast/oslo")
+
+        builds = 0
+        literal_pattern = template_module._literal_pattern
+
+        def counting(text: str) -> str:
+            nonlocal builds
+            builds += 1
+            return literal_pattern(text)
+
+        monkeypatch.setattr(template_module, "_literal_pattern", counting)
+        template_module.build_regex.cache_clear()
+        for _ in range(3):
+            wrapped = FastMCPProviderResourceTemplate.wrap(None, source)
+            assert wrapped.matches("mounted://forecast/bergen") == {"city": "bergen"}
+        assert builds == 0
+
+    def test_copy_can_override_list_query_params(self):
+        def search(tags: list[str] | None = None) -> str:
+            return ",".join(tags or [])
+
+        template = ResourceTemplate.from_function(
+            search, uri_template="items://all{?tags}"
+        )
+        assert template.matches("items://all?tags=a,b") == {"tags": ["a", "b"]}
+        scalar = template.model_copy(update={"_list_query_params": frozenset()})
+        assert scalar.matches("items://all?tags=a,b") == {"tags": "a,b"}
+
+    def test_shared_pattern_cache_is_bounded(self):
+        """Template strings can come from a proxied server, so the shared cache
+        must not grow with every template a remote ever sends."""
+        from fastmcp.resources import template as template_module
+
+        for i in range(5000):
+            match_uri_template("remote://none", f"remote-{i}://{{x}}")
+        assert template_module.build_regex.cache_info().currsize <= 4096
 
     def test_matching_reuses_the_compiled_template_pattern(self, monkeypatch):
         """Reads try every template in turn, so a template's pattern is built
@@ -908,6 +1009,48 @@ class TestMalformedURITemplates:
         )
         assert result is not None
         assert result == {"id": "42", "format": ""}
+
+    def test_fragment_does_not_prevent_match(self):
+        result = match_uri_template(
+            "test://items/42#section",
+            "test://items/{id}",
+        )
+        assert result == {"id": "42"}
+
+    def test_query_fragment_is_not_part_of_param(self):
+        result = match_uri_template(
+            "test://items?filter=active#section",
+            "test://items{?filter}",
+        )
+        assert result == {"filter": "active"}
+
+    def test_fragment_after_path_param_and_query(self):
+        result = match_uri_template(
+            "test://items/42?format=json#section",
+            "test://items/{id}{?format}",
+        )
+        assert result == {"id": "42", "format": "json"}
+
+    def test_literal_fragment_in_template_still_matches(self):
+        result = match_uri_template(
+            "test://items/42#details",
+            "test://items/{id}#details",
+        )
+        assert result == {"id": "42"}
+
+    def test_literal_fragment_in_template_rejects_other_fragment(self):
+        result = match_uri_template(
+            "test://items/42#other",
+            "test://items/{id}#details",
+        )
+        assert result is None
+
+    def test_encoded_hash_stays_in_path_param(self):
+        result = match_uri_template(
+            "test://items/a%23b",
+            "test://items/{id}",
+        )
+        assert result == {"id": "a#b"}
 
     def test_query_param_with_blank_and_present_values(self):
         """Mix of blank and non-blank query values are both surfaced."""
@@ -1381,6 +1524,25 @@ class TestInternalMetaNotLeaked:
 
         async with Client(mcp) as client:
             result = await client.read_resource(read_uri)
+
+        assert result[0].meta is None
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            TextResource(uri="data://text", name="text", text="value"),
+            BinaryResource(uri="data://binary", name="binary", data=b"value"),
+        ],
+    )
+    async def test_visibility_marker_stripped_from_static_resource_meta(
+        self, resource: TextResource | BinaryResource
+    ):
+        mcp = FastMCP()
+        mcp.add_resource(resource)
+        mcp.enable(names={str(resource.uri)})
+
+        async with Client(mcp) as client:
+            result = await client.read_resource(str(resource.uri))
 
         assert result[0].meta is None
 
